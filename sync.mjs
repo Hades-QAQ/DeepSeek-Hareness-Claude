@@ -1,0 +1,64 @@
+import {returnFiles} from './return-files.mjs';
+import {spawn,spawnSync} from 'node:child_process';
+import {readFileSync} from 'node:fs';
+import path from 'node:path';
+const {host,project,identity,action,files=[],message=''}=JSON.parse(readFileSync(0,'utf8').replace(/^\uFEFF/,''));
+function execute(exe,args,input){
+ const r=spawnSync(exe,args,{encoding:'utf8',input,stdio:['pipe','pipe','pipe'],maxBuffer:32*1024*1024,timeout:120000,windowsHide:true,env:{...process.env,GIT_TERMINAL_PROMPT:'0'}});
+ if(r.error||r.status!==0)throw Error(r.error?.message||r.stderr.trim()||exe+' failed');
+ return r.stdout;
+}
+const git=(...args)=>execute('git',['--literal-pathspecs',...args]);
+const quote=s=>"'"+s.replaceAll("'","'\\''")+"'";
+function changes(){
+ return git('status','--porcelain=v1','-z','--no-renames','--untracked-files=all').split('\0').filter(Boolean).map(s=>({status:s.slice(0,2),file:s.slice(3)}));
+}
+function report(stage){if(process.env.DSH_PROGRESS)process.stderr.write('!P:'+stage+'!\r\n')}
+async function push(args){
+ report('upload');
+ const child=spawn('git',args,{windowsHide:true,stdio:['ignore','ignore','pipe'],env:{...process.env,LC_ALL:'C',GIT_TERMINAL_PROMPT:'0'}});
+ let pending='',err='',last='';
+ child.stderr.on('data',buf=>{
+  const part=buf.toString();err=(err+part).slice(-4000);
+  const lines=(pending+part).split(/[\r\n]/);pending=lines.pop().slice(-2000);
+  for(const line of lines){
+   const m=/^(Counting objects|Compressing objects|Writing objects):\s*(\d+)%/.exec(line);
+   if(!m)continue;const stage=({'Counting objects':'count','Compressing objects':'compress','Writing objects':'upload'})[m[1]]+m[2];
+   if(stage!==last){last=stage;report(stage);if(stage==='upload100')report('confirm')}
+  }
+ });
+ await new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',code=>code===0?resolve():reject(Error(err.trim()||'推送失败')))});
+}
+async function main(){
+ if(['watch-status','watch-on','watch-off'].includes(action))return returnFiles(action,{host,project,identity});
+ if(path.resolve(git('rev-parse','--show-toplevel').trim()).toLowerCase()!==path.resolve('.').toLowerCase())throw Error('请在 Git 仓库根目录打开工作区。');
+ const branch=git('symbolic-ref','--short','HEAD').trim();
+ if(action==='list')return {branch,changes:changes()};
+ if(!/^[\w][\w.@-]*$/.test(host)||!/^\w[\w-]{0,47}$/.test(project)||!/^[a-zA-Z0-9_][\w./-]*$/.test(branch))throw Error('SSH 或分支设置无效');
+ const opts=['-o','BatchMode=yes','-o','StrictHostKeyChecking=yes','-o','ConnectTimeout=10',...(identity?['-o','IdentitiesOnly=yes','-i',identity]:[])];
+ const dest=host+':projects/'+project;
+ const sshCmd=['ssh',...opts].map(quote).join(' ');
+ const net=(...args)=>git('-c','core.sshCommand='+sshCmd,...args);
+ if(action==='pull'){
+  if(changes().length)throw Error('本地有修改，已暂停拉取。请先处理本地变更。');
+  net('fetch','--no-tags',dest,'refs/heads/'+branch);return git('merge','--ff-only','FETCH_HEAD').trim();
+ }
+ if(action!=='push')throw Error('未知操作');
+ const cwd='"$HOME/projects/'+project+'"';
+ report('check');
+ execute('ssh',[...opts,host,'set -e; umask 077; mkdir -p '+cwd+'; cd '+cwd+'; if test ! -e .git; then test -z "$(ls -A)" || { echo "Remote directory is not empty" >&2; exit 1; }; git init -b '+quote(branch)+'; fi; test "$(git rev-parse --show-toplevel)" = "$(pwd -P)" && test "$(git symbolic-ref --short HEAD)" = '+quote(branch)+' && test -z "$(git status --porcelain)" || { echo "Remote branch or working tree is not ready" >&2; exit 1; }; git config receive.denyCurrentBranch updateInstead']);
+ if(files.length){
+  report('scan');
+  const current=new Map(changes().map(x=>[x.file,x.status]));
+  if(!message.trim()||files.some(f=>!current.has(f)))throw Error('请刷新文件列表并填写提交说明。');
+  if(files.some(f=>current.get(f)==='UU'||current.get(f).includes('U')||['AA','DD'].includes(current.get(f))))throw Error('请先解决合并冲突。');
+  const paths=files.join('\0')+'\0';
+  const add=files.filter(f=>current.get(f)==='??');
+  if(add.length)execute('git',['--literal-pathspecs','add','--intent-to-add','--pathspec-from-file=-','--pathspec-file-nul'],add.join('\0')+'\0');
+  report('commit');
+  execute('git',['--literal-pathspecs','commit','--only','-m',message,'--pathspec-from-file=-','--pathspec-file-nul'],paths);
+ }
+ await push(['-c','core.sshCommand='+sshCmd,'push','--progress',dest,'HEAD:refs/heads/'+branch]);
+ return '已推送 '+git('rev-parse','--short','HEAD').trim()+' 到 '+branch;
+}
+try{console.log(JSON.stringify({ok:true,result:await main()}))}catch(e){console.log(JSON.stringify({ok:false,error:e.message}));process.exitCode=1}

@@ -2,6 +2,7 @@ import {spawnSync} from 'node:child_process';
 import {existsSync,mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
+import {fileURLToPath} from 'node:url';
 import {createHash,randomUUID} from 'node:crypto';
 import {createInterface} from 'node:readline/promises';
 const [action,host,project,identity='']=process.argv.slice(2);
@@ -24,6 +25,11 @@ const git=(...args)=>run('git',args,true);
 let rl;
 async function yes(msg){rl ??= createInterface({input:process.stdin,output:process.stdout}); return (await rl.question(msg+' [y/N] ')).trim().toLowerCase()==='y'}
 async function main(){
+ if(action==='sync'){
+  const ui=spawnSync('powershell.exe',['-NoProfile','-STA','-File',fileURLToPath(new URL('./sync.ps1',import.meta.url))],{stdio:'inherit',env:{...process.env,DSH_SYNC_HOST:host,DSH_SYNC_PROJECT:project,DSH_SYNC_IDENTITY:identity}});
+  if(ui.error||ui.status!==0)throw Error(ui.error?.message||'无法打开同步窗口');
+  return;
+ }
  if(['claude','shell'].includes(action)){
   const name=session+'-'+action, mark='"$HOME/.local/state/dsh-remote/'+name+'"';
   // tmux atomically rejects duplicate names; attach only after the winner creates it.
