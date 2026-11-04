@@ -115,6 +115,7 @@ window.__ModuleLoader__.load({
     const choices=await ctx.webTerminals.launchShells(session,new AbortController().signal);
     const ps=choices.shells.find(s=>/(?:^|[\\/])(?:pwsh|powershell)(?:\.exe)?$/i.test(s.path));if(!ps)throw Error('当前 DSH 环境没有 Windows PowerShell 终端');
     const token=crypto.randomUUID();
+    if(op==='claude')await syncRequest(ctx,session,{...cfg,action:'bind-chat',sessionId:session});
     tab.actions.openTab('terminal',{params:{shellPath:ps.path,dshRemoteLaunch:token,dshRemoteOperation:op}});
     for(let n=0;n<150;n++){
      for(const t of ctx.sidebarRight.openTabs.getSnapshot()){
@@ -129,8 +130,8 @@ window.__ModuleLoader__.load({
       if(op==='claude'){
        const pane=document.querySelector('div[data-sidebar-right-tab="'+CSS.escape(t.tabId)+'"]');
        const target=pane && ctx.sidebarRight.focusedTarget(pane);
-       if(target?.sessionId===session && pane.closest('[data-sidebar-right-panel="push"]'))ctx.sidebarRight.toggleFullscreen(target);
-       pane?.querySelector('.xterm-helper-textarea')?.focus();
+       if(target?.sessionId===session && pane.closest('[data-sidebar-right-panel="fullscreen"]'))ctx.sidebarRight.toggleFullscreen(target);
+       document.querySelector('[data-composer-input]')?.focus();
       }
       return;
      }
@@ -258,6 +259,49 @@ window.__ModuleLoader__.load({
     };
     document.head.append(css,rows);refresh();decorate();const off=ctx.workspaces.list.subscribe(()=>{refresh();decorate()});const observer=new MutationObserver(decorate);observer.observe(document.body,{childList:true,subtree:true});
     return ()=>{observer.disconnect();off();document.querySelectorAll("[data-dsh-claude-control]").forEach(el=>el.remove());css.remove();rows.remove()};
+   });
+   ctx.effect(()=>{
+    const dock=document.createElement('details'),toggle=document.createElement('summary'),card=document.createElement('section');
+    dock.className='dsh-quota';toggle.textContent='◴  Claude 额度';toggle.title='查看 Claude 套餐额度';
+    const style=document.createElement('style');
+    style.textContent='.dsh-quota{position:fixed;left:16px;bottom:56px;z-index:25;font:12px/1.5 system-ui;color:var(--text-primary,#eee)}.dsh-quota summary{cursor:pointer;list-style:none;background:#292624;color:#efa98e;border:1px solid #675047;border-radius:18px;padding:2px 10px}.dsh-quota section{position:absolute;left:0;bottom:calc(100% + 8px);width:min(260px,80vw);padding:16px;background:#292726;color:#eee;border:1px solid #55504c;border-radius:14px;box-shadow:0 8px 32px #0005}.dsh-quota section>*{display:block}.dsh-quota section strong{margin-top:12px}.dsh-quota progress{width:100%;height:5px;accent-color:#d97757}.dsh-quota small{color:#bdb6b0}.dsh-quota button{margin-top:10px;color:#efa98e;background:transparent;border:0;cursor:pointer}';
+    document.head.append(style);dock.append(toggle,card);document.body.append(dock);
+    let key='',target=null,epoch=0,busy=false,last=0;
+    const add=(tag,text)=>{const el=document.createElement(tag);el.textContent=text;card.append(el);return el};
+    const stamp=t=>new Date(t*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+    async function load(enable=false){
+     if(!target||busy||!dock.open)return;
+     const generation=epoch;busy=true;last=Date.now();
+     if(!card.childElementCount)add('small','正在读取服务器额度…');
+     try{
+      const data=await syncRequest(ctx,target.session,{...target.cfg,action:enable?'quota-enable':'quota'});
+      if(generation!==epoch)return;
+      card.replaceChildren();add('b','Claude 套餐额度');
+      if(data===null){add('small','在当前服务器启用 Claude 状态栏后即可读取额度。');add('button','启用额度显示').onclick=()=>load(true);return}
+      for(const [id,label] of [['five_hour','5 小时'],['seven_day','每周']]){
+       const w=data.windows?.[id],valid=w && (!w.reset||w.reset>Date.now()/1000);
+       add('strong',label+'限额 · '+(valid?'剩余 '+w.remaining+'%':'等待更新'));
+       if(valid){const bar=add('progress','');bar.max=100;bar.value=w.remaining;bar.setAttribute('aria-label',label+'剩余百分比');if(w.reset)add('small',stamp(w.reset)+' 重置')}
+      }
+      add('small',data.updated?'上次更新 '+stamp(data.updated)+' · 本地时间':'等待 Claude Code 返回用量');
+     }catch(e){if(generation===epoch){card.replaceChildren();add('small','额度读取失败 · '+String(e.message||e).slice(0,160))}}
+     finally{if(generation===epoch)busy=false}
+    }
+    function tick(){
+     const session=ctx.sidebarRight.commandTarget(null)?.sessionId;
+     const ws=info(workspaces().find(w=>w.sessionIds.includes(session)));
+     let cfg;try{cfg=ws&&JSON.parse(localStorage.getItem(id+':'+ws.workspaceId)||'null')}catch{}
+     const next=cfg?.host?JSON.stringify([session,cfg.host,cfg.identity]):'';
+     if(next!==key){epoch++;busy=false;key=next;target=next?{session,cfg}:null;dock.open=false;card.replaceChildren();last=0}
+     dock.hidden=!next;
+     if(dock.open&&Date.now()-last>=60000)void load();
+    }
+    dock.ontoggle=()=>{if(dock.open)void load()};
+    const outside=e=>{if(dock.open&&!dock.contains(e.target))dock.open=false};
+    const escape=e=>{if(e.key==='Escape'&&dock.open){dock.open=false;toggle.focus()}};
+    document.addEventListener('pointerdown',outside);document.addEventListener('keydown',escape);
+    tick();const timer=setInterval(tick,1500);
+    return ()=>{epoch++;clearInterval(timer);document.removeEventListener('pointerdown',outside);document.removeEventListener('keydown',escape);dock.remove();style.remove()};
    });
    ctx.effect(()=>ctx.sidebarRightTabs.register({id,kind,multiple:true,priority:'builtin',title:()=>'远程 Claude',guide:[{id:'new',order:21,title:()=>'远程 Claude',description:()=>'SSH、Git 和多模态工作区'}]}));
    for(const [name,component] of [['sidebar.right.tab.guide.entry',Guide],['sidebar.right.pane.tab',Body],['sidebar.right.pane.tab.title',()=>h('span',{className:'dsh-claude-tab'},'Claude 工作区')]]){

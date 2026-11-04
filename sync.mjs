@@ -1,8 +1,9 @@
 import {returnFiles} from './return-files.mjs';
 import {spawn,spawnSync} from 'node:child_process';
-import {readFileSync} from 'node:fs';
+import {createHash,randomUUID} from 'node:crypto';
+import {mkdirSync,writeFileSync,renameSync,readFileSync} from 'node:fs';
 import path from 'node:path';
-const {host,project,identity,action,files=[],message=''}=JSON.parse(readFileSync(0,'utf8').replace(/^\uFEFF/,''));
+const {host,project,identity,action,sessionId,files=[],message=''}=JSON.parse(readFileSync(0,'utf8').replace(/^\uFEFF/,''));
 function execute(exe,args,input){
  const r=spawnSync(exe,args,{encoding:'utf8',input,stdio:['pipe','pipe','pipe'],maxBuffer:32*1024*1024,timeout:120000,windowsHide:true,env:{...process.env,GIT_TERMINAL_PROMPT:'0'}});
  if(r.error||r.status!==0)throw Error(r.error?.message||r.stderr.trim()||exe+' failed');
@@ -30,6 +31,22 @@ async function push(args){
  await new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',code=>code===0?resolve():reject(Error(err.trim()||'推送失败')))});
 }
 async function main(){
+ if(action==='quota'||action==='quota-enable'){
+  if(!/^[\w][\w.@-]*$/.test(host)||typeof identity!=='string')throw Error('SSH 配置无效');
+  const args=['-o','BatchMode=yes','-o','StrictHostKeyChecking=yes','-o','ConnectTimeout=8',...(identity?['-o','IdentitiesOnly=yes','-i',identity]:[]),host];
+  if(action==='quota-enable'){
+   const install=`set -e; tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT; cat > "$tmp"; python3 "$tmp" install`;
+   execute('ssh',[...args,install],readFileSync(new URL('./quota.py',import.meta.url)));
+  }
+  const probe='cd "$HOME/.local/state/dsh-remote" 2>/dev/null && test -f quota.py || { echo null; exit 0; }; if test -s quota.json; then cat quota.json; else echo "{}"; fi';
+  return JSON.parse(execute('ssh',[...args,probe]));
+ }
+ if(action==='bind-chat'){
+  if(!/^[\w.-]{1,180}$/.test(sessionId)|| !/^[\w][\w.@-]*$/.test(host)||!/^\w[\w-]{0,47}$/.test(project)||typeof identity!=='string')throw Error('会话绑定信息无效');
+  const dir=path.join(process.env.LOCALAPPDATA,'DSH-Remote-Claude','chat-routes');mkdirSync(dir,{recursive:true});
+  const file=path.join(dir,createHash('sha256').update(sessionId).digest('hex')+'.json'),temp=file+'.'+randomUUID();
+  writeFileSync(temp,JSON.stringify({host,project,identity}),{mode:0o600});renameSync(temp,file);return true;
+ }
  if(['watch-status','watch-on','watch-off'].includes(action))return returnFiles(action,{host,project,identity});
  if(path.resolve(git('rev-parse','--show-toplevel').trim()).toLowerCase()!==path.resolve('.').toLowerCase())throw Error('请在 Git 仓库根目录打开工作区。');
  const branch=git('symbolic-ref','--short','HEAD').trim();
